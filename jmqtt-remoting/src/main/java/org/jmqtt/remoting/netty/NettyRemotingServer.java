@@ -8,6 +8,7 @@ import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.HttpContentCompressor;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
@@ -16,6 +17,7 @@ import io.netty.handler.codec.mqtt.MqttEncoder;
 import io.netty.handler.codec.mqtt.MqttMessage;
 import io.netty.handler.codec.mqtt.MqttMessageType;
 import io.netty.handler.timeout.IdleStateHandler;
+import org.jmqtt.common.config.BrokerConfig;
 import org.jmqtt.common.config.NettyConfig;
 import org.jmqtt.common.helper.MixAll;
 import org.jmqtt.common.helper.Pair;
@@ -42,10 +44,12 @@ public class NettyRemotingServer implements RemotingService {
     private Class<? extends ServerChannel> clazz;
     private Map<MqttMessageType, Pair<RequestProcessor, ExecutorService>> processorTable;
     private NettyEventExcutor nettyEventExcutor;
+    private BrokerConfig brokerConfig;
 
-    public NettyRemotingServer(NettyConfig nettyConfig, ChannelEventListener listener) {
+    public NettyRemotingServer(BrokerConfig brokerConfig, NettyConfig nettyConfig, ChannelEventListener listener) {
         this.nettyConfig = nettyConfig;
         this.processorTable = new HashMap();
+        this.brokerConfig = brokerConfig;
         this.nettyEventExcutor = new NettyEventExcutor(listener);
 
         if(!nettyConfig.isUseEpoll()){
@@ -68,15 +72,26 @@ public class NettyRemotingServer implements RemotingService {
     public void start() {
         //Netty event excutor start
         this.nettyEventExcutor.start();
-        // start TCP 1883 server
-        startTcpServer();
+        // start TCP server
+        if (nettyConfig.isStartTcp()) {
+            startTcpServer(false, nettyConfig.getTcpPort());
+        }
+
+        if (nettyConfig.isStartSslTcp()) {
+            startTcpServer(true, nettyConfig.getSslTcpPort());
+        }
+
         // start Websocket server
-        if(nettyConfig.isStartWebsocket()){
-            startWebsocketServer();
+        if (nettyConfig.isStartWebsocket()) {
+            startWebsocketServer(false, nettyConfig.getWebsocketPort());
+        }
+
+        if (nettyConfig.isStartSslWebsocket()) {
+            startWebsocketServer(true, nettyConfig.getSslWebsocketPort());
         }
     }
 
-    private void startWebsocketServer(){
+    private void startWebsocketServer(boolean useSsl, Integer port){
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(selectorGroup,ioGroup)
                 .channel(clazz)
@@ -90,15 +105,26 @@ public class NettyRemotingServer implements RemotingService {
                     @Override
                     protected void initChannel(SocketChannel socketChannel) throws Exception {
                         ChannelPipeline pipeline = socketChannel.pipeline();
+                        if (useSsl) {
+                            pipeline.addLast("ssl", NettySslHandler.getSslHandler(
+                                    socketChannel,
+                                    nettyConfig.isUseClientCA(),
+                                    nettyConfig.getSslKeyStoreType(),
+                                    brokerConfig.getJmqttHome() + nettyConfig.getSslKeyFilePath(),
+                                    nettyConfig.getSslManagerPwd(),
+                                    nettyConfig.getSslStorePwd()
+                            ));
+                        }
                         pipeline.addLast("idleStateHandler", new IdleStateHandler(0, 0, 60))
-                                .addLast("nettyConnectionManager", new NettyConnectHandler(nettyEventExcutor))
                                 .addLast("httpCodec",new HttpServerCodec())
                                 .addLast("aggregator",new HttpObjectAggregator(65535))
-                                .addLast("webSocketHandler",new WebSocketServerProtocolHandler("/mqtt", MixAll.MQTT_VERSION_SUPPORT))
-                                .addLast("webSocket2ByteBufDecoder",new WebSocket2ByteBufDecoder())
+                                .addLast("compressor ", new HttpContentCompressor())
+                                .addLast("webSocketHandler",new WebSocketServerProtocolHandler("/mqtt", MixAll.MQTT_VERSION_SUPPORT,true))
                                 .addLast("byteBuf2WebSocketEncoder",new ByteBuf2WebSocketEncoder())
-                                .addLast("mqttEncoder", MqttEncoder.INSTANCE)
+                                .addLast("webSocket2ByteBufDecoder",new WebSocket2ByteBufDecoder())
                                 .addLast("mqttDecoder", new MqttDecoder(nettyConfig.getMaxMsgSize()))
+                                .addLast("mqttEncoder", MqttEncoder.INSTANCE)
+                                .addLast("nettyConnectionManager", new NettyConnectHandler(nettyEventExcutor))
                                 .addLast("nettyMqttHandler", new NettyMqttHandler());
                     }
                 });
@@ -106,14 +132,14 @@ public class NettyRemotingServer implements RemotingService {
             bootstrap.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
         }
         try {
-            ChannelFuture future = bootstrap.bind(nettyConfig.getWebsocketPort()).sync();
-            log.info("Start webSocket server success,port = {}",nettyConfig.getWebsocketPort());
+            ChannelFuture future = bootstrap.bind(port).sync();
+            log.info("Start webSocket server {}  success,port = {}", useSsl?"with ssl":"", port);
         }catch (InterruptedException ex){
-            log.error("Start webSocket server failure.cause={}",ex);
+            log.error("Start webSocket server {} failure.cause={}", useSsl?"with ssl":"", ex);
         }
     }
 
-    private void startTcpServer(){
+    private void startTcpServer(boolean useSsl, Integer port){
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(selectorGroup,ioGroup)
                 .channel(clazz)
@@ -127,6 +153,16 @@ public class NettyRemotingServer implements RemotingService {
                     @Override
                     protected void initChannel(SocketChannel socketChannel) throws Exception {
                         ChannelPipeline pipeline = socketChannel.pipeline();
+                        if (useSsl) {
+                            pipeline.addLast("ssl", NettySslHandler.getSslHandler(
+                                    socketChannel,
+                                    nettyConfig.isUseClientCA(),
+                                    nettyConfig.getSslKeyStoreType(),
+                                    brokerConfig.getJmqttHome() + nettyConfig.getSslKeyFilePath(),
+                                    nettyConfig.getSslManagerPwd(),
+                                    nettyConfig.getSslStorePwd()
+                            ));
+                        }
                         pipeline.addLast("idleStateHandler", new IdleStateHandler(60, 0, 0))
                                 .addLast("mqttEncoder", MqttEncoder.INSTANCE)
                                 .addLast("mqttDecoder", new MqttDecoder(nettyConfig.getMaxMsgSize()))
@@ -138,10 +174,10 @@ public class NettyRemotingServer implements RemotingService {
             bootstrap.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
         }
         try {
-            ChannelFuture future = bootstrap.bind(nettyConfig.getTcpPort()).sync();
-            log.info("Start tcp server success,port = {}",nettyConfig.getTcpPort());
+            ChannelFuture future = bootstrap.bind(port).sync();
+            log.info("Start tcp server {} success,port = {}", useSsl?"with ssl":"", port);
         }catch (InterruptedException ex){
-            log.error("Start tcp server failure.cause={}",ex);
+            log.error("Start tcp server {} failure.cause={}", useSsl?"with ssl":"", ex);
         }
     }
 
